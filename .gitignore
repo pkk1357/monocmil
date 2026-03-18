@@ -1,0 +1,15 @@
+# 파이썬 캐시 파일 제외 (캡처에 보이는 __pycache__ 등)
+__pycache__/
+*.py[cod]
+*.class
+
+# 주피터 노트북 체크포인트 제외
+.ipynb_checkpoints/
+
+# 혹시 모를 대용량 데이터나 모델 가중치 파일 제외
+*.pt
+*.pth
+*.h5
+*.tsv
+data2/
+data3/
