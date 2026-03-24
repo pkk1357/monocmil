@@ -26,7 +26,10 @@ class FeatureMemoryBank:
 
     def update_statistics(self, task_id, f_bags):
         self.mu[task_id] = torch.mean(f_bags, dim=0)
-        self.sigma[task_id] = torch.std(f_bags, dim=0) + 1e-6
+        if f_bags.shape[0] > 1:
+            self.sigma[task_id] = torch.std(f_bags, dim=0) + 1e-8
+        else:
+            self.sigma[task_id] = torch.ones_like(torch.mean(f_bags, dim=0)) * 1e-4
 
     def sample_past_features(self, task_id, batch_size, f_cur=None):
         past_features = {}
