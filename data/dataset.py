@@ -78,3 +78,15 @@ def scan_all_tcga_classes(base_path):
             if cid != -1: label_to_files[cid].append(path)
             
     return label_to_files
+
+def progressive_patch_masking(features, step, total_steps=80, max_ratio=0.3):
+    """
+    학습 안정화를 위해 패치의 일부를 무작위로 제거합니다.
+    """
+    ratio = max_ratio * (step / total_steps)
+    n_patches = features.shape[0]
+    # 남길 패치 개수 계산
+    n_keep = max(1, int(n_patches * (1 - ratio)))
+    
+    indices = torch.randperm(n_patches)[:n_keep].to(features.device)
+    return features[indices, :]

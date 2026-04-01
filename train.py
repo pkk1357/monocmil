@@ -1,196 +1,149 @@
-import os
-import copy
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
-from data.dataset import scan_all_tcga_classes, MonoCMILDataset, collate_MIL
-from models.abmil import GatedAttention
-from models.mlp_head import ProjectionHead
-from core.memory import FeatureMemoryBank
-from core.losses import MonoCMIL_Loss
+# 1. 사용자 정의 모듈 임포트
+from models.network import MonoCMIL_Network
+from core.losses import MonoCMILLoss
 from core.anchor import generate_orthogonal_anchor
-from utils.metrics import evaluate_continual_learning
+from core.memory import FeatureMemoryBank
+# data/dataset.py에 scan_all_tcga_classes와 MonoCMILDataset이 있다고 가정합니다.
+from data.dataset import MonoCMILDataset, collate_MIL, scan_all_tcga_classes, progressive_patch_masking
 
-# 1. 학습 유틸리티 정의
-def progressive_patch_masking(features, step, total_steps, max_ratio=0.3):
-    ratio = max_ratio * (step / total_steps)
-    N = features.shape[0]
-    indices = torch.randperm(N)[:max(1, int(N * (1 - ratio)))].to(features.device)
-    return features[indices, :]
-
-class Center(nn.Module):
-    def __init__(self, init_tensor):
-        super().__init__()
-        self.c = nn.Parameter(init_tensor.squeeze(0))
-    def forward(self):
-        return self.c
-
-def orth_loss(cur_adapter, adapter_list):
-    loss = 0.0
-    for prev_adapter in adapter_list:
-        cur_w = cur_adapter.attention_w.weight
-        prev_w = prev_adapter.attention_w.weight
-        loss += torch.abs(torch.mean(torch.matmul(cur_w, prev_w.transpose(1, 0))))
-    return loss
-
-# 2. 설정 및 데이터 로드
-SCENARIO = "A1"
-BASE_PATH = "/data3/jinsol/TCGA/features_conch_256/pt_files"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"\n" + "="*50)
+print(f"▶ 현재 사용 장치: {DEVICE}")
+if DEVICE.type == 'cuda':
+    print(f"▶ GPU 모델: {torch.cuda.get_device_name(0)}")
+    print(f"▶ 사용 가능 GPU 개수: {torch.cuda.device_count()}")
+print("="*50 + "\n")
 
+# 2. 경로 및 하이퍼파라미터 설정 (보내주신 이미지 근거)
+# 이미지 상의 경로: data/pt_files 내부에 TCGA-XXX 폴더들이 존재
+BASE_PATH = "/media/jinsol/data/pt_files" 
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 LR = 0.001
 BATCH_SIZE = 10
-STEPS_P1 = 80 
-STEPS_P2 = 120 
+STEPS_P1 = 80   # Phase 1: 80 steps [cite: 981]
+STEPS_P2 = 120  # Phase 2: 120 steps [cite: 981]
+Z_DIM = 256     # Table 5 최적 값 [cite: 797]
 
-all_class_files = scan_all_tcga_classes(BASE_PATH)
-tasks = [[i] for i in range(25)] if SCENARIO == "A1" else [[0], [1], [2, 3], [4, 5], [6], [7, 8], [9, 10], [11, 12], [13, 14], [15, 16], [17], [18, 19], [20, 21], [22], [23], [24]]
+# 3. 데이터 스캔 및 Task(클래스) 리스트 생성
+# 사용자님의 scan_all_tcga_classes 함수를 통해 {0: [파일들], 1: [...]} 딕셔너리 생성
+all_label_files = scan_all_tcga_classes(BASE_PATH)
 
-# 3. 모델 및 글로벌 상태 초기화
-adapter_list = nn.ModuleList()
-MLP_model = ProjectionHead(input_dim=512, hidden_dim=512, z_dim=256).to(DEVICE)
-memory_bank = FeatureMemoryBank(z_dim=512)
-criterion_p2 = MonoCMIL_Loss(beta=1.0, temp=0.1).to(DEVICE)
-existing_anchors = [] 
+# 4. 모델 및 핵심 객체 초기화
+model = MonoCMIL_Network(input_dim=512, d=Z_DIM).to(DEVICE)
+criterion = MonoCMILLoss(beta=1.0, temp=0.1).to(DEVICE)
+memory_bank = FeatureMemoryBank(d=512)
+existing_anchors = []
 
-# 4. 메인 학습 루프
-for t_idx, class_ids in enumerate(tasks):
-    print(f"\n{'='*70}\n [Task {t_idx+1}] 학습 시작 (Class IDs: {class_ids})\n{'='*70}")
+# --- [메인 증분 학습 루프: 25개 클래스 순차 학습] ---
+for t_idx in range(25):
+    class_files = all_label_files[t_idx]
+    if not class_files: # 데이터가 없는 클래스는 건너뜀
+        continue
+        
+    t = t_idx + 1 
+    print(f"\n{'='*30}\n[Task {t}] Class ID {t_idx} 학습 시작\n{'='*30}")
+
+    # 데이터셋 및 로더 생성
+    dataset = MonoCMILDataset(file_list=class_files, label_idx=t_idx)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_MIL)
     
-    cur_adapter = GatedAttention(input_dim=512, hidden_dim=512).to(DEVICE)
-    cur_adapter.requires_grad_(True)
+    # 새로운 클래스를 위한 고유 앵커 생성 (Eq. 2) [cite: 376]
+    a_t = generate_orthogonal_anchor(d=Z_DIM, existing_anchors=existing_anchors).to(DEVICE)
+    existing_anchors.append(a_t)
+
+    # ---------------------------------------------------------
+    # [Phase 1] MIL Aggregator Training (80 Steps)
+    # 목적: 새로운 클래스의 특징을 센터 c(t)로 응집 [cite: 288]
+    # ---------------------------------------------------------
+    print("▶ Phase 1: MIL Aggregator 최적화 진행 중 (MLP 고정)...")
+    model.mil_aggregator.train()
+    model.mlp_head.requires_grad_(False) # MLP 가중치 고정 [cite: 981]
     
-    task_files = []
-    for cid in class_ids: task_files.extend(all_class_files[cid])
-    loader = DataLoader(MonoCMILDataset(task_files, t_idx), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, collate_fn=collate_MIL)
+    optimizer_mil = optim.Adam(model.mil_aggregator.parameters(), lr=LR)
     data_iter = iter(loader)
 
-    # --- Center 초기화 ---
-    cur_adapter.eval()
-    init_z = []
-    with torch.no_grad():
-        for feat_list, _ in loader:
-            for feat in feat_list:
-                z, _ = cur_adapter(feat.to(DEVICE).unsqueeze(0))
-                init_z.append(z.squeeze(0))
-                if len(init_z) >= 10: break
-            if len(init_z) >= 10: break
-            
-    center = Center(torch.stack(init_z).mean(dim=0, keepdim=True)).to(DEVICE)
-
-    optimizer_MIL = optim.Adam(list(cur_adapter.parameters()) + list(center.parameters()), lr=LR)
-    optimizer_MLP = optim.Adam(MLP_model.parameters(), lr=LR)
-    scheduler_MIL = get_cosine_schedule_with_warmup(optimizer_MIL, num_warmup_steps=int(STEPS_P1*0.1), num_training_steps=STEPS_P1)
-    scheduler_MLP = get_cosine_schedule_with_warmup(optimizer_MLP, num_warmup_steps=int(STEPS_P2*0.1), num_training_steps=STEPS_P2)
-
-    # [Phase 1] MIL Aggregator Training (80 Steps)
-    print("▶ Phase 1: MIL Adapter & Center 최적화 진행 중...")
-    cur_adapter.train()
-    center.train()
-    
     for step in range(STEPS_P1):
-        try: feat_list, _ = next(data_iter)
-        except StopIteration: data_iter = iter(loader); feat_list, _ = next(data_iter)
+        try: features_list, labels = next(data_iter)
+        except StopIteration: data_iter = iter(loader); features_list, labels = next(data_iter)
         
-        optimizer_MIL.zero_grad()
-        accum_loss = 0.0
+        # [Appendix A2] 점진적 패치 마스킹 적용 [cite: 981]
+        masked_features = [progressive_patch_masking(f.to(DEVICE), step, STEPS_P1) for f in features_list]
         
-        for feat in feat_list:
-            feat_masked = progressive_patch_masking(feat.to(DEVICE), step, STEPS_P1)
-            aggregated_vec, _ = cur_adapter(feat_masked.unsqueeze(0)) 
-            c = center()
-            
-            loss = torch.mean((aggregated_vec.squeeze(0) - c) ** 2)
-            if len(adapter_list) > 0:
-                loss += orth_loss(cur_adapter, adapter_list) * 0.001 * torch.exp(torch.tensor(-(t_idx+1.0), device=DEVICE))
-            accum_loss += loss / len(feat_list)
-            
-        accum_loss.backward()
-        optimizer_MIL.step()
-        scheduler_MIL.step()
+        optimizer_mil.zero_grad()
         
-        if (step+1) % 20 == 0: print(f"   [Step {step+1}/{STEPS_P1}] MIL Loss: {accum_loss.item():.4f}")
+        # 슬라이드별 임베딩 z 추출
+        z_list = []
+        for f in masked_features:
+            # f: (N, 512) -> unsqueeze -> (1, N, 512)
+            z, _, _ = model(f.unsqueeze(0))
+            z_list.append(z)
+        z_i_t = torch.cat(z_list, dim=0) # (Batch, Z_DIM)
+        
+        # c_t: 현재 클래스의 데이터 중심점 (Empirical mean) [cite: 294]
+        c_t = z_i_t.mean(dim=0, keepdim=True).detach()
+        
+        # L_MIL 계산 (Eq. 1) [cite: 290]
+        loss_p1 = criterion.forward_phase1(z_i_t, c_t)
+        loss_p1.backward()
+        optimizer_mil.step()
+        
+        if (step+1) % 20 == 0:
+            print(f"   [Step {step+1}/{STEPS_P1}] MIL Loss: {loss_p1.item():.4f}")
 
-    # --- 어댑터 저장 및 통계/앵커 업데이트 ---
-    cur_adapter.requires_grad_(False)
-    adapter_list.append(copy.deepcopy(cur_adapter))
-    
-    with torch.no_grad():
-        clean_feat_list, _ = next(iter(loader))
-        clean_z_list = []
-        for clean_feat in clean_feat_list:
-            clean_f_bag, _ = cur_adapter(clean_feat.to(DEVICE).unsqueeze(0))
-            clean_z_list.append(clean_f_bag.squeeze(0))
-            
-        memory_bank.update_statistics(t_idx, torch.stack(clean_z_list))
-        
-        anchor = generate_orthogonal_anchor(256, existing_anchors).to(DEVICE)
-        existing_anchors.append(anchor.cpu())
-
+    # ---------------------------------------------------------
     # [Phase 2] MLP Head Training (120 Steps, 3-Stage)
-    print("\n▶ Phase 2: MLP 3-Stage 공간 분리 최적화 진행 중...")
-    cur_adapter.eval()
-    MLP_model.train()
+    # 목적: 앵커를 활용한 공간 분리 및 과거 지식 복습 [cite: 397]
+    # ---------------------------------------------------------
+    print("▶ Phase 2: MLP Head 3단계 최적화 진행 중 (MIL 고정)...")
+    model.mil_aggregator.eval() 
+    model.mil_aggregator.requires_grad_(False) # MIL 가중치 고정 [cite: 133]
+    model.mlp_head.requires_grad_(True)
     
-    step1, step2 = STEPS_P2 // 3, (STEPS_P2 * 2) // 3 
-    stats_list = [] 
-    
+    optimizer_mlp = optim.Adam(model.mlp_head.parameters(), lr=LR)
+
     for step in range(STEPS_P2):
-        optimizer_MLP.zero_grad()
-        try: feat_list, _ = next(data_iter)
-        except StopIteration: data_iter = iter(loader); feat_list, _ = next(data_iter)
+        # 40스텝마다 Stage 1->2->3 변경 [cite: 981]
+        stage = (step // 40) + 1 
         
-        z_RT_list = []
-        for feat in feat_list:
-            z_RT, _ = cur_adapter(feat.to(DEVICE).unsqueeze(0))
-            z_RT_list.append(z_RT.squeeze(0))
-        x_RT_batch = torch.stack(z_RT_list).detach()
-        y_RT = MLP_model(x_RT_batch)
+        try: features_list, labels = next(data_iter)
+        except StopIteration: data_iter = iter(loader); features_list, labels = next(data_iter)
         
-        # 딕셔너리 언패킹 로직 적용
-        y_past_list = []
-        if t_idx > 0:
-            # 1. 함수를 한 번만 호출해서 모든 과거 데이터 딕셔너리를 받아옵니다.
-            past_features_dict = memory_bank.sample_past_features(t_idx, len(feat_list), f_cur=x_RT_batch)
-            
-            # 2. 딕셔너리에서 키값(past_idx)으로 텐서를 하나씩 꺼내 씁니다.
-            for past_idx in range(t_idx):
-                x_past_fake = past_features_dict[past_idx].to(DEVICE)
-                y_past = MLP_model(x_past_fake)
-                y_past_list.append(y_past)
-            
-        loss_p2 = criterion_p2(
-            MLP_model=MLP_model, x_RT_batch=x_RT_batch, y_RT=y_RT, 
-            y_past_list=y_past_list, anchor=anchor, stats_list=stats_list, 
-            step=step, step1=step1, step2=step2, task_id=t_idx
-        )
+        optimizer_mlp.zero_grad()
+
+        # 1. 현재 데이터의 특징(f_bag) 추출 및 투사(z)
+        f_bag_list = []
+        with torch.no_grad():
+            for f in features_list:
+                f_bag, A = model.mil_aggregator(f.to(DEVICE).unsqueeze(0))
+                f_bag_list.append(f_bag)
+        z_cur = model.mlp_head(torch.cat(f_bag_list, dim=0))
+        
+        # 2. 과거 데이터 합성 (Generative Feature Replay) [cite: 388]
+        z_past_list = []
+        if t > 1:
+            # j=1...t-1 까지의 통계량에서 샘플링 [cite: 388]
+            f_past_dict = memory_bank.sample_past_features(t_idx, BATCH_SIZE)
+            z_past_list = [model.mlp_head(f_p.to(DEVICE)) for f_p in f_past_dict.values()]
+
+        # 3. 논문의 3단계 로스 적용 (Eq. 5 ~ 15) [cite: 401, 484, 472]
+        loss_p2 = criterion.forward_phase2(z_cur, z_past_list, a_t, stage, t)
         loss_p2.backward()
-        optimizer_MLP.step()
-        scheduler_MLP.step()
+        optimizer_mlp.step()
 
         if (step+1) % 40 == 0:
-            stage = (step // 40) + 1
             print(f"   [Stage {stage} 완료] Step {step+1} Loss: {loss_p2.item():.4f}")
 
-    # [평가] metrics.py의 함수를 호출하여 간단하게 실행
-    print(f"\n[Task {t_idx+1}] 모델 평가 진행 중 (지금까지 배운 모든 Task 대상)...")
-    
-    acc, bacc, wf1 = evaluate_continual_learning(
-        t_idx=t_idx, 
-        tasks=tasks, 
-        all_class_files=all_class_files, 
-        adapter_list=adapter_list, 
-        MLP_model=MLP_model, 
-        existing_anchors=existing_anchors, 
-        device=DEVICE
-    )
-    
-    print(f"[Task {t_idx+1} 누적 평가 결과]")
-    print(f"   - ACC (정확도)      : {acc:.2f}%")
-    print(f"   - BACC (균형 정확도): {bacc:.2f}%")
-    print(f"   - WF1 (가중치 F1)   : {wf1:.4f}")
+    # --- Task 종료 후 처리: 다음 복습을 위한 통계량(mu, sigma) 저장 [cite: 387] ---
+    with torch.no_grad():
+        all_f_bags = []
+        for feat_list, _ in loader:
+            for f in feat_list:
+                f_bag, A = model.mil_aggregator(f.to(DEVICE).unsqueeze(0))
+                all_f_bags.append(f_bag)
+        memory_bank.update_statistics(t_idx, torch.cat(all_f_bags, dim=0))
 
-print("\n전체 클래스 학습 완료")
+print("\n[학습 종료] 모든 TCGA 클래스 학습이 완료되었습니다! 🎉")
